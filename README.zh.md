@@ -4,6 +4,10 @@
 
 [English](./README.md)
 
+![侧边栏底部的面板](./assets/screenshot-footer.webp)
+
+![悬停提示：估算背后的确切数字](./assets/screenshot-tooltip.webp)
+
 ## 显示什么
 
 侧边栏展开时：

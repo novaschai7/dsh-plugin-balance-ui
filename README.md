@@ -4,6 +4,10 @@ Account and usage panel for the [DeepSeek Harness](https://github.com/deepseek-a
 
 [中文说明](./README.zh.md)
 
+![The panel in the sidebar footer](./assets/screenshot-footer.webp)
+
+![The tooltip, with the exact figures behind the estimate](./assets/screenshot-tooltip.webp)
+
 ## What it shows
 
 With the sidebar expanded:
