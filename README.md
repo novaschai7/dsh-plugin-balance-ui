@@ -18,7 +18,7 @@ With the sidebar expanded:
 | 今日 | Today's total tokens (input + output + cache hits), compacted |
 | 花费 | Estimated spend for today, in CNY |
 | 时段 | `高峰` or `空闲` for the billing tier in force right now |
-| 对账 | Over the last 7 days, the gap between the local estimate and what the account balance actually lost |
+| 对账 | The gap between the local estimate and what the account balance actually lost, over the fully sampled days (up to 7) |
 
 While the sidebar is collapsed, the same four values are stacked as compact text inside the rail.
 
@@ -63,7 +63,9 @@ An estimate that silently drifts from the real bill is worse than no estimate, a
 
 So the host half samples the account balance on a timer — every 15 minutes whether or not a UI is open, plus whenever the footer polls — and keeps a small local history. Spending is recovered as the sum of the balance **decreases** between samples. Increases are never counted as spending; they are classified as a top-up (a rise in `topped_up_balance`) or a grant (a rise in `granted_balance`).
 
-The footer's `对账` row then shows the 7-day gap between the two, and the tooltip breaks it down per day and names every cause it can actually observe:
+The footer's `对账` row then shows the gap between the two, and the tooltip breaks it down per day and names every cause it can actually observe:
+
+**Only days the sampler covered from their midnight are compared**, so the window grows from one full day toward seven as sampling accumulates. A partially sampled day is excluded rather than counted against an estimate that covers the whole day — otherwise every install would report a large fake drift on its first day. The panel states the window it used. On a fresh install the row reads `样本不足` until the first full day is available.
 
 - **Usage this machine never saw.** The real charge is higher than the log estimate — calls from another client, a direct API integration, or session logs that were pruned.
 - **Discounts or grants absorbing the cost.** The real charge is lower than the estimate.
@@ -73,8 +75,6 @@ The footer's `对账` row then shows the 7-day gap between the two, and the tool
 - **Unpriced models.** Tokens from a model with no rate-table entry are reported rather than quietly costed at zero.
 
 **Two blind spots are stated rather than papered over.** Local session records carry no cache-write field at all, so if DeepSeek charges for cache writes, that cost is invisible to this estimate and the panel says so unconditionally. And reconciliation is only attempted for a **CNY** account: the rate table is in CNY, so a differently-denominated account is left uncompared instead of compared wrongly.
-
-A fresh install has no samples yet, so the row reads `样本不足` until the sampler has run for a while.
 
 ## Install
 

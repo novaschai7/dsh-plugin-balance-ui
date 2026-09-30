@@ -168,3 +168,52 @@ test('buildReconciliation returns null until both halves have arrived', () => {
   assert.equal(client.buildReconciliation({ ok: true, history: [] }, null), null)
   assert.equal(client.buildReconciliation({ ok: false, error: 'x' }, ledgerBody([])), null)
 })
+
+/** Local `YYYY-MM-DD` for a day `offsetDays` before today. */
+function dayKey(offsetDays = 0) {
+  const date = new Date()
+  date.setHours(0, 0, 0, 0)
+  date.setDate(date.getDate() - offsetDays)
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${date.getFullYear()}-${month}-${day}`
+}
+
+/** An ISO instant at `extraHours` past local midnight `offsetDays` ago. */
+function localInstant(offsetDays, extraHours) {
+  const date = new Date()
+  date.setHours(0, 0, 0, 0)
+  date.setDate(date.getDate() - offsetDays)
+  return new Date(date.getTime() + extraHours * 3_600_000).toISOString()
+}
+
+test('buildReconciliation only compares days the sampling fully covers', () => {
+  const history = {
+    ok: true,
+    history: [dayRow(dayKey(1), 1_000_000, 0), dayRow(dayKey(0), 1_000_000, 0)],
+  }
+  const ledger = ledgerBody([
+    { date: dayKey(1), spend: 99, topUp: 0, grant: 0, observations: 1 },
+    { date: dayKey(0), spend: 2, topUp: 0, grant: 0, observations: 1 },
+  ], { coveredFrom: localInstant(1, 10) }) // sampling began mid-morning yesterday
+
+  const recon = client.buildReconciliation(history, ledger)
+  assert.equal(recon.dayCount, 1, 'the only partially sampled day is excluded')
+  assert.ok(Math.abs(recon.estimated - 2) < 1e-9, `estimated was ${recon.estimated}`)
+  assert.ok(Math.abs(recon.actual - 2) < 1e-9, `actual was ${recon.actual}`)
+  assert.ok(Math.abs(recon.drift) < 1e-9, 'a correct day must not read as drift')
+  assert.ok(recon.causes.some((cause) => cause.includes('对账区间')))
+})
+
+test('buildReconciliation waits for one fully sampled day instead of a whole week', () => {
+  const history = { ok: true, history: [dayRow(dayKey(0), 1_000_000, 0)] }
+  const ledger = ledgerBody(
+    [{ date: dayKey(0), spend: 1, topUp: 0, grant: 0, observations: 1 }],
+    { coveredFrom: localInstant(0, 10) }, // sampling began today
+  )
+
+  const recon = client.buildReconciliation(history, ledger)
+  assert.equal(recon.ready, false)
+  assert.equal(recon.dayCount, 0)
+  assert.ok(recon.causes.some((cause) => cause.includes('至少一整天')), 'and says why')
+})

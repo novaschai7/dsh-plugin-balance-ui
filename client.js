@@ -258,6 +258,22 @@ window.__ModuleLoader__.load({
       return typeof key === "string" && key.length >= 10 ? key.slice(5) : String(key);
     }
 
+    /**
+     * Local `YYYY-MM-DD` for an ISO timestamp.
+     *
+     * History day keys are LOCAL days (the host buckets them with
+     * `localDateKey`), so the covered-from instant has to be reduced to a local
+     * day the same way rather than compared as a UTC date.
+     */
+    function localDayKey(iso) {
+      const parsed = typeof iso === "string" ? Date.parse(iso) : Number.NaN;
+      if (!Number.isFinite(parsed)) return null;
+      const date = new Date(parsed);
+      const month = String(date.getMonth() + 1).padStart(2, "0");
+      const day = String(date.getDate()).padStart(2, "0");
+      return `${date.getFullYear()}-${month}-${day}`;
+    }
+
     /** Whole hours, for the sampling-gap caveat. */
     function hours(ms) {
       if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) return "0";
@@ -293,41 +309,51 @@ window.__ModuleLoader__.load({
         (Array.isArray(ledger.rows) ? ledger.rows : []).map((row) => [row.date, row]),
       );
 
-      let estimated = 0;
-      let unpriced = false;
-      const days = [];
+      // Price every day the history reported, then keep only the days the
+      // ledger fully covers. A day is comparable once sampling reaches back
+      // past its midnight; otherwise the estimate would span more time than
+      // the balance movement does, and every gap would read as a false drift.
+      const everyDay = [];
       for (const row of rows) {
         const tokens = typeof row.totalTokens === "number" ? row.totalTokens : 0;
         let cny = 0;
+        let dayUnpriced = false;
         if (tokens > 0) {
           const cost = estimateCost(row);
           cny = cost.cny;
-          if (cost.unpriced) unpriced = true;
+          dayUnpriced = cost.unpriced;
         }
-        const actual = ledgerRows.get(row.date);
-        estimated += cny;
-        days.push({
+        const actualRow = ledgerRows.get(row.date);
+        everyDay.push({
           date: row.date,
           tokens,
           estimated: cny,
-          actual: actual === undefined ? 0 : actual.spend,
+          actual: actualRow === undefined ? 0 : actualRow.spend,
+          unpriced: dayUnpriced,
         });
       }
 
-      const actual = typeof ledger.spend === "number" ? ledger.spend : 0;
+      const coveredKey = localDayKey(ledger.coveredFrom);
+      const days = coveredKey === null ? everyDay : everyDay.filter((day) => day.date > coveredKey);
+      const estimated = days.reduce((sum, day) => sum + day.estimated, 0);
+      const actual = days.reduce((sum, day) => sum + day.actual, 0);
+      const unpriced = days.some((day) => day.unpriced);
       const drift = actual - estimated;
       // The rate table is CNY, so an account in another currency cannot be
       // compared against it at all rather than compared wrongly.
       const comparable = ledger.currency === "CNY";
-      const ready = comparable && typeof ledger.sampleCount === "number" && ledger.sampleCount > 0 && ledger.covered === true;
+      const sampled = typeof ledger.sampleCount === "number" && ledger.sampleCount > 0;
+      const ready = comparable && sampled && days.length > 0;
 
       const causes = [];
       if (!comparable) {
         causes.push(`账户以 ${ledger.currency || "未知币种"} 计价，本插件按人民币价目表估算，因此不做对账`);
-      } else if (!(typeof ledger.sampleCount === "number" && ledger.sampleCount > 0)) {
+      } else if (!sampled) {
         causes.push("还没有余额采样样本，插件运行一段时间后才可对账");
-      } else if (ledger.covered !== true) {
-        causes.push(`对账只覆盖 ${ledger.coveredFrom === null || ledger.coveredFrom === undefined ? "最近" : beijingStamp(Date.parse(ledger.coveredFrom))} 之后，此前的余额未知`);
+      } else if (days.length === 0) {
+        causes.push("对账需要至少一整天完整的余额采样，明天起可用");
+      } else if (coveredKey !== null && days.length < everyDay.length) {
+        causes.push(`对账区间为 ${shortDate(days[0].date)} 起，更早的时段没有采样`);
       }
       if (ledger.gapSuspect === true) {
         causes.push(`采样间隔最长 ${hours(ledger.maxGapMs)} 小时，期间的消耗与充值可能互相抵消而看不到`);
@@ -354,6 +380,7 @@ window.__ModuleLoader__.load({
 
       return {
         days,
+        dayCount: days.length,
         ready,
         comparable,
         currency: ledger.currency,
@@ -536,22 +563,31 @@ window.__ModuleLoader__.load({
 
       // --- Reconciliation -------------------------------------------------
       const reconView = recon === null ? null : buildReconciliation(recon.history, recon.ledger);
-      const reconText = reconView === null
+      // Distinguish "still loading" from "the host has nothing to give": a
+      // fetch that came back empty means the host half is not serving the
+      // reconciliation routes at all, which is what an un-restarted service
+      // looks like.
+      const reconUnavailable = recon !== null && reconView === null;
+      const reconText = recon === null
         ? "\u2026"
-        : reconView.ready
-          ? `${RECON_DAYS}\u65e5 ${signed(reconView.drift)}`
-          : "\u6837\u672c\u4e0d\u8db3";
-      const reconDetail = reconView === null
+        : reconUnavailable
+          ? "\u2014"
+          : reconView.ready
+            ? `${reconView.dayCount}\u65e5 ${signed(reconView.drift)}`
+            : "\u6837\u672c\u4e0d\u8db3";
+      const reconDetail = recon === null
         ? []
-        : [
-          reconView.ready
-            ? `\u5bf9\u8d26\uff08\u8fd1 ${RECON_DAYS} \u5929\uff09\u4f30\u7b97 \u00a5${reconView.estimated.toFixed(2)}\uff0c\u5b9e\u9645\u4f59\u989d\u6d88\u8017 \u00a5${reconView.actual.toFixed(2)}\uff0c\u5dee ${signed(reconView.drift)}`
-            : "\u5bf9\u8d26\uff1a\u6682\u65e0\u6cd5\u6bd4\u8f83",
-          ...reconView.days
-            .filter((day) => day.tokens > 0 || day.actual > 0)
-            .map((day) => `${shortDate(day.date)} \u4f30\u7b97 \u00a5${day.estimated.toFixed(2)} / \u5b9e\u9645 \u00a5${day.actual.toFixed(2)}`),
-          ...reconView.causes.map((cause) => `\u00b7 ${cause}`),
-        ];
+        : reconView === null
+          ? ["\u5bf9\u8d26\u4e0d\u53ef\u7528\uff1a\u5bbf\u4e3b\u7aef\u672a\u63d0\u4f9b /dsh-usage-history \u6216 /dsh-spend-ledger\uff0c\u901a\u5e38\u610f\u5473\u7740 dsh \u670d\u52a1\u8fd8\u6ca1\u6709\u91cd\u542f"]
+          : [
+            reconView.ready
+              ? `\u5bf9\u8d26\uff08${reconView.dayCount} \u5929\uff09\u4f30\u7b97 \u00a5${reconView.estimated.toFixed(2)}\uff0c\u5b9e\u9645\u4f59\u989d\u6d88\u8017 \u00a5${reconView.actual.toFixed(2)}\uff0c\u5dee ${signed(reconView.drift)}`
+              : "\u5bf9\u8d26\uff1a\u6682\u65e0\u6cd5\u6bd4\u8f83",
+            ...reconView.days
+              .filter((day) => day.tokens > 0 || day.actual > 0)
+              .map((day) => `${shortDate(day.date)} \u4f30\u7b97 \u00a5${day.estimated.toFixed(2)} / \u5b9e\u9645 \u00a5${day.actual.toFixed(2)}`),
+            ...reconView.causes.map((cause) => `\u00b7 ${cause}`),
+          ];
 
       const detail = [
         `当前时段 ${tierText}\uff08deepseek-flash \u8f93\u5165 \u00a5${rateNow.input} / \u8f93\u51fa \u00a5${rateNow.output} \u6bcf\u767e\u4e07 tokens\uff09\uff0c\u4e0b\u6b21\u5207\u6362 ${nextSwitchText}`,
