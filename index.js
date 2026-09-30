@@ -300,11 +300,6 @@ function sessionsRoot() {
   return join(dshHome(), 'sessions')
 }
 
-/** Absolute path of the plugin's own local balance-sample store. */
-function sampleStorePath() {
-  return join(dshHome(), 'dsh-plugin-balance-ui', 'balance-samples.json')
-}
-
 /** Collect session-log files touched at or after `since`, newest last. */
 async function collectLogs(dir, since, out) {
   let entries
@@ -456,9 +451,9 @@ function isSample(value) {
 }
 
 /** Read the local balance-sample store, tolerating any corruption. */
-async function loadSamples() {
+async function loadSamples(path) {
   try {
-    const parsed = JSON.parse(await readFile(sampleStorePath(), 'utf8'))
+    const parsed = JSON.parse(await readFile(path, 'utf8'))
     const list = Array.isArray(parsed) ? parsed : parsed?.samples
     return Array.isArray(list) ? list.filter(isSample) : []
   } catch {
@@ -467,8 +462,7 @@ async function loadSamples() {
 }
 
 /** Write the local balance-sample store through a temporary file. */
-async function saveSamples(samples) {
-  const path = sampleStorePath()
+async function saveSamples(path, samples) {
   await mkdir(dirname(path), { recursive: true })
   const temporary = `${path}.tmp`
   await writeFile(temporary, JSON.stringify({ version: 1, samples }, null, 0), 'utf8')
@@ -601,6 +595,16 @@ export function apply(ctx) {
   const historyCache = new Map()
   const ledgerCache = new Map()
 
+  /**
+   * The sample store path, resolved ONCE.
+   *
+   * `sampleOnce` keeps running across several awaits, so resolving this from
+   * the environment on each use would let a mid-flight change of `DSH_HOME`
+   * redirect the write — which is exactly how a test harness can end up
+   * writing into the real home directory.
+   */
+  const storePath = join(dshHome(), 'dsh-plugin-balance-ui', 'balance-samples.json')
+
   /** Resolved balance samples, loaded from disk once. */
   let samples
   let samplesLoaded = false
@@ -698,7 +702,7 @@ export function apply(ctx) {
   /** Ensure the sample store has been read from disk exactly once. */
   async function ensureSamples() {
     if (samplesLoaded) return samples
-    samples = await loadSamples()
+    samples = await loadSamples(storePath)
     samplesLoaded = true
     return samples
   }
@@ -735,7 +739,7 @@ export function apply(ctx) {
       list.push({ t: now, currency: info.currency, total, granted, toppedUp })
       const cutoff = now - SAMPLE_RETENTION_MS
       while (list.length > 0 && list[0].t < cutoff) list.shift()
-      await saveSamples(list)
+      await saveSamples(storePath, list)
     } catch {
       /* sampling is best-effort and must never disturb the host */
     } finally {
@@ -745,7 +749,7 @@ export function apply(ctx) {
 
   const readLedger = (days) => cachedByKey(ledgerCache, LEDGER_CACHE_MS, clampDays(days), async () => {
     const list = await ensureSamples()
-    return { ...computeLedger(list, clampDays(days)), store: sampleStorePath() }
+    return { ...computeLedger(list, clampDays(days)), store: storePath }
   })
 
   // Sample on a timer so the ledger keeps filling even with no UI open. The

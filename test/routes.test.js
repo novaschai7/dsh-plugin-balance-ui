@@ -80,6 +80,11 @@ async function waitFor(probe, timeoutMs = 2000) {
   return false
 }
 
+/** Let the sampler's in-flight work settle before a temp home is removed. */
+async function drain() {
+  for (let i = 0; i < 3; i += 1) await new Promise((resolve) => setTimeout(resolve, 20))
+}
+
 /** Run `body` with a temp DSH_HOME, a stubbed fetch and a live plugin. */
 async function withPlugin(body, resolveCredential) {
   const home = await mkdtemp(join(tmpdir(), 'balance-ui-routes-'))
@@ -94,10 +99,11 @@ async function withPlugin(body, resolveCredential) {
     await body({ home, routes })
   } finally {
     for (const dispose of disposers) dispose()
+    await drain()
     if (previousHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = previousHome
     globalThis.fetch = originalFetch
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 }
 
@@ -227,4 +233,44 @@ test('reports a missing credential instead of calling upstream', async () => {
     assert.match(json.error, /DEEPSEEK_API_KEY/)
     assert.equal(fetched, false, 'upstream must not be called without a credential')
   }, async () => ({ value: '' }))
+})
+
+test('the sampler writes to the home it was applied with, not a later one', async () => {
+  // Regression: sampleOnce spans several awaits, so a store path resolved from
+  // the environment on each use could be redirected mid-flight. That is how a
+  // test harness ends up writing into the real ~/.dsh.
+  const first = await mkdtemp(join(tmpdir(), 'balance-ui-home-a-'))
+  const second = await mkdtemp(join(tmpdir(), 'balance-ui-home-b-'))
+  const previousHome = process.env.DSH_HOME
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, json: async () => BALANCE_BODY })
+
+  const { ctx, disposers } = fakeContext()
+  const storeIn = (home) => join(home, 'dsh-plugin-balance-ui', 'balance-samples.json')
+  const exists = async (path) => {
+    try {
+      await readFile(path, 'utf8')
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  try {
+    process.env.DSH_HOME = first
+    apply(ctx)
+    process.env.DSH_HOME = second // re-point while the first sample is in flight
+    await new Promise((resolve) => setTimeout(resolve, 80))
+
+    assert.equal(await exists(storeIn(first)), true, 'the sample lands in the home captured at apply time')
+    assert.equal(await exists(storeIn(second)), false, 'a later DSH_HOME must not redirect the store')
+  } finally {
+    for (const dispose of disposers) dispose()
+    await drain()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    globalThis.fetch = originalFetch
+    await rm(first, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
+    await rm(second, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
+  }
 })
