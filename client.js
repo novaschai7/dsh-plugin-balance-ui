@@ -26,6 +26,16 @@ window.__ModuleLoader__.load({
     const POLL_MS = 10_000;
 
     /**
+     * Reconciliation refresh cadence. The history fold walks more logs than the
+     * today fold, and the host caches both for 60s, so asking faster would only
+     * return the same answer.
+     */
+    const RECON_MS = 60_000;
+
+    /** Days of history the reconciliation compares over. */
+    const RECON_DAYS = 7;
+
+    /**
      * Token rates, CNY per million tokens — DeepSeek's official list price.
      *
      * Source: https://api-docs.deepseek.com/zh-cn/quick_start/pricing
@@ -243,6 +253,124 @@ window.__ModuleLoader__.load({
       return value.toLocaleString("en-US");
     }
 
+    /** `MM-DD` label for a `YYYY-MM-DD` day key. */
+    function shortDate(key) {
+      return typeof key === "string" && key.length >= 10 ? key.slice(5) : String(key);
+    }
+
+    /** Whole hours, for the sampling-gap caveat. */
+    function hours(ms) {
+      if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) return "0";
+      return (ms / 3_600_000).toFixed(ms < 3_600_000 ? 1 : 0);
+    }
+
+    /** Signed CNY, e.g. "+¥0.05" / "-¥0.12". */
+    function signed(value) {
+      if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+      return `${value >= 0 ? "+" : "-"}\u00a5${Math.abs(value).toFixed(2)}`;
+    }
+
+    /**
+     * Compare what the local logs say was spent against what the account
+     * balance actually did over the same window.
+     *
+     * The two figures are expected to differ, and the point of this function is
+     * to say by how much and why, not to force them to agree. Every cause it
+     * lists is one it can actually observe; the cache-write caveat is listed
+     * unconditionally because local session logs carry no cache-write field at
+     * all, so that charge is structurally invisible here.
+     *
+     * @param history - a /dsh-usage-history body.
+     * @param ledger - a /dsh-spend-ledger body.
+     * @returns null while either half is still missing.
+     */
+    function buildReconciliation(history, ledger) {
+      if (history === null || ledger === null) return null;
+      if (history.ok !== true || ledger.ok !== true) return null;
+
+      const rows = Array.isArray(history.history) ? history.history : [];
+      const ledgerRows = new Map(
+        (Array.isArray(ledger.rows) ? ledger.rows : []).map((row) => [row.date, row]),
+      );
+
+      let estimated = 0;
+      let unpriced = false;
+      const days = [];
+      for (const row of rows) {
+        const tokens = typeof row.totalTokens === "number" ? row.totalTokens : 0;
+        let cny = 0;
+        if (tokens > 0) {
+          const cost = estimateCost(row);
+          cny = cost.cny;
+          if (cost.unpriced) unpriced = true;
+        }
+        const actual = ledgerRows.get(row.date);
+        estimated += cny;
+        days.push({
+          date: row.date,
+          tokens,
+          estimated: cny,
+          actual: actual === undefined ? 0 : actual.spend,
+        });
+      }
+
+      const actual = typeof ledger.spend === "number" ? ledger.spend : 0;
+      const drift = actual - estimated;
+      // The rate table is CNY, so an account in another currency cannot be
+      // compared against it at all rather than compared wrongly.
+      const comparable = ledger.currency === "CNY";
+      const ready = comparable && typeof ledger.sampleCount === "number" && ledger.sampleCount > 0 && ledger.covered === true;
+
+      const causes = [];
+      if (!comparable) {
+        causes.push(`账户以 ${ledger.currency || "未知币种"} 计价，本插件按人民币价目表估算，因此不做对账`);
+      } else if (!(typeof ledger.sampleCount === "number" && ledger.sampleCount > 0)) {
+        causes.push("还没有余额采样样本，插件运行一段时间后才可对账");
+      } else if (ledger.covered !== true) {
+        causes.push(`对账只覆盖 ${ledger.coveredFrom === null || ledger.coveredFrom === undefined ? "最近" : beijingStamp(Date.parse(ledger.coveredFrom))} 之后，此前的余额未知`);
+      }
+      if (ledger.gapSuspect === true) {
+        causes.push(`采样间隔最长 ${hours(ledger.maxGapMs)} 小时，期间的消耗与充值可能互相抵消而看不到`);
+      }
+      if (typeof ledger.topUp === "number" && ledger.topUp > 0) {
+        causes.push(`窗口内充值 \u00a5${ledger.topUp.toFixed(2)}，充值不计入消耗`);
+      }
+      if (typeof ledger.grant === "number" && ledger.grant > 0) {
+        causes.push(`窗口内赠送额度入账 \u00a5${ledger.grant.toFixed(2)}，属于免费额度`);
+      }
+      if (unpriced) {
+        causes.push("有模型的 token 不在费率表内，未计入估算");
+      }
+      const holidays = days.filter((day) => HOLIDAYS.has(day.date)).map((day) => shortDate(day.date));
+      if (holidays.length > 0) {
+        causes.push(`窗口内 ${holidays.join("、")} 是法定节假日，按空闲档计价`);
+      }
+      if (ready && Math.abs(drift) >= 0.005) {
+        causes.push(drift > 0
+          ? "实际高于估算：可能有本机日志未记录的调用（其他客户端或直连 API），或费率表低于实际计费"
+          : "实际低于估算：可能有折扣或赠送抵扣，或费率表高于实际计费");
+      }
+      causes.push("本地会话日志不记录缓存写入 token，若上游对其计费，这部分无法从本机估算");
+
+      return {
+        days,
+        ready,
+        comparable,
+        currency: ledger.currency,
+        estimated,
+        actual,
+        drift,
+        covered: ledger.covered === true,
+        coveredFrom: ledger.coveredFrom,
+        gapSuspect: ledger.gapSuspect === true,
+        maxGapMs: ledger.maxGapMs,
+        topUp: ledger.topUp,
+        grant: ledger.grant,
+        unpriced,
+        causes,
+      };
+    }
+
     /** Read one JSON route, returning null instead of throwing. */
     async function readRoute(path, signal) {
       try {
@@ -307,6 +435,7 @@ window.__ModuleLoader__.load({
       const wide = props?.wide !== false;
       const [balance, setBalance] = react.useState(null);
       const [usage, setUsage] = react.useState(null);
+      const [recon, setRecon] = react.useState(null);
       const [tier, setTier] = react.useState(() => tierAt(Date.now()));
 
       // The tier changes on wall-clock boundaries rather than on data arriving,
@@ -347,6 +476,35 @@ window.__ModuleLoader__.load({
         };
       }, []);
 
+      // Reconciliation moves far more slowly than the footer's own numbers, so
+      // it gets its own slower tick rather than riding the 10s poll.
+      react.useEffect(() => {
+        let alive = true;
+        const controller = new AbortController();
+
+        const tick = async () => {
+          const [nextHistory, nextLedger] = await Promise.all([
+            readRoute(`./dsh-usage-history?days=${RECON_DAYS}`, controller.signal),
+            readRoute(`./dsh-spend-ledger?days=${RECON_DAYS}`, controller.signal),
+          ]);
+          if (!alive) return;
+          if (nextHistory !== null || nextLedger !== null) {
+            setRecon((previous) => ({
+              history: nextHistory ?? previous?.history ?? null,
+              ledger: nextLedger ?? previous?.ledger ?? null,
+            }));
+          }
+        };
+
+        tick();
+        const timer = setInterval(tick, RECON_MS);
+        return () => {
+          alive = false;
+          clearInterval(timer);
+          controller.abort();
+        };
+      }, []);
+
       const info = balance && balance.ok === true ? balance.infos?.[0] : undefined;
       const balanceText = info !== undefined
         ? `${symbolOf(info.currency)}${info.total}`
@@ -376,6 +534,25 @@ window.__ModuleLoader__.load({
       const nextSwitchText = beijingStamp(nextTierChangeMs(Date.now()));
       const bucketed = usage !== null && usage.peak !== undefined && usage.offPeak !== undefined;
 
+      // --- Reconciliation -------------------------------------------------
+      const reconView = recon === null ? null : buildReconciliation(recon.history, recon.ledger);
+      const reconText = reconView === null
+        ? "\u2026"
+        : reconView.ready
+          ? `${RECON_DAYS}\u65e5 ${signed(reconView.drift)}`
+          : "\u6837\u672c\u4e0d\u8db3";
+      const reconDetail = reconView === null
+        ? []
+        : [
+          reconView.ready
+            ? `\u5bf9\u8d26\uff08\u8fd1 ${RECON_DAYS} \u5929\uff09\u4f30\u7b97 \u00a5${reconView.estimated.toFixed(2)}\uff0c\u5b9e\u9645\u4f59\u989d\u6d88\u8017 \u00a5${reconView.actual.toFixed(2)}\uff0c\u5dee ${signed(reconView.drift)}`
+            : "\u5bf9\u8d26\uff1a\u6682\u65e0\u6cd5\u6bd4\u8f83",
+          ...reconView.days
+            .filter((day) => day.tokens > 0 || day.actual > 0)
+            .map((day) => `${shortDate(day.date)} \u4f30\u7b97 \u00a5${day.estimated.toFixed(2)} / \u5b9e\u9645 \u00a5${day.actual.toFixed(2)}`),
+          ...reconView.causes.map((cause) => `\u00b7 ${cause}`),
+        ];
+
       const detail = [
         `当前时段 ${tierText}\uff08deepseek-flash \u8f93\u5165 \u00a5${rateNow.input} / \u8f93\u51fa \u00a5${rateNow.output} \u6bcf\u767e\u4e07 tokens\uff09\uff0c\u4e0b\u6b21\u5207\u6362 ${nextSwitchText}`,
         info !== undefined && info.toppedUp !== undefined ? `充值 ${symbolOf(info.currency)}${info.toppedUp}` : null,
@@ -397,6 +574,7 @@ window.__ModuleLoader__.load({
             exact(usage.offPeak.cacheReadTokens)} \u7f13\u5b58 \u2192 \u00a5${cost.offPeakCny.toFixed(2)}`
           : null,
         cost !== null && !costKnown ? "该模型无费率，无法估算花费" : null,
+        ...reconDetail,
         balance && balance.ok === false ? `余额读取失败：${balance.error}` : null,
         usage && usage.ok === false ? `用量读取失败：${usage.error}` : null,
       ].filter(Boolean).join("\n");
@@ -419,6 +597,7 @@ window.__ModuleLoader__.load({
             { style: tier === "peak" ? { fontSize: "9px", ...styles.tierPeak } : { fontSize: "9px" } },
             tier === "peak" ? "\u5cf0" : "\u95f2",
           ),
+          react.createElement("div", { style: { fontSize: "9px" } }, reconText),
         );
       }
 
@@ -450,6 +629,12 @@ window.__ModuleLoader__.load({
           react.createElement("span", { style: styles.caption }, "时段"),
           tierBadge,
         ),
+        react.createElement(
+          "div",
+          { style: styles.line },
+          react.createElement("span", { style: styles.caption }, "对账"),
+          react.createElement("span", { style: styles.value }, reconText),
+        ),
       );
     }
 
@@ -471,6 +656,8 @@ window.__ModuleLoader__.load({
     exports.BalanceFooter = BalanceFooter;
     /** Exported for out-of-tree verification of the pricing maths. */
     exports.estimateCost = estimateCost;
+    /** Exported for out-of-tree verification of the reconciliation maths. */
+    exports.buildReconciliation = buildReconciliation;
     /** Exported for out-of-tree verification of the peak/off-peak calendar. */
     exports.tierAt = tierAt;
     exports.nextTierChangeMs = nextTierChangeMs;

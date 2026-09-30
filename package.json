@@ -25,6 +25,9 @@
   "engines": {
     "node": ">=22.15.0"
   },
+  "scripts": {
+    "test": "node --test"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

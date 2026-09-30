@@ -1,27 +1,41 @@
 /**
- * dsh-plugin-balance-ui — account and usage panel for the dsh Web client.
+ * dsh-plugin-balance-ui — account, usage and reconciliation panel for dsh.
  *
  * Two faces, one package:
- *   - host half (this file): GET /dsh-balance (upstream account balance) and
- *     GET /dsh-usage (today's token usage folded out of the local session logs).
- *   - browser half (./client.js): renders both in the sidebar footer.
+ *   - host half (this file): GET /dsh-balance (upstream account balance),
+ *     GET /dsh-usage (today's token usage), GET /dsh-usage-history (per-day
+ *     usage for a window) and GET /dsh-spend-ledger (what the account balance
+ *     actually did over that window, sampled locally).
+ *   - browser half (./client.js): renders all four in the sidebar footer.
  *
  * Installed as a dsh bundle: package.json declares `dsh.bundle.patch`, and
  * ./cordis.patch.yml inserts this entry into the profile's layer stack.
+ *
+ * WHY THE LEDGER EXISTS
+ * Local session logs record what dsh spent; the account balance records what
+ * the account was actually charged. Nothing local can see the difference, so
+ * this plugin samples the balance on a timer and keeps a small local history.
+ * Comparing the two is the only way to tell a user why their own numbers and
+ * their bill disagree — and to say honestly which of the causes can and cannot
+ * be seen from this machine.
  *
  * The DeepSeek credential never leaves this process: no response, log line, or
  * error message contains the API key.
  */
 
-import { readFile, readdir, stat } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 
 /** Account-balance route. */
 const BALANCE_PATH = '/dsh-balance'
 /** Today's-usage route. */
 const USAGE_PATH = '/dsh-usage'
+/** Per-day usage history route. */
+const HISTORY_PATH = '/dsh-usage-history'
+/** Locally sampled account-balance ledger route. */
+const LEDGER_PATH = '/dsh-spend-ledger'
 /** Credential reference resolved through the host credential seam. */
 const CREDENTIAL_REF = 'DEEPSEEK_API_KEY'
 /** Upstream account endpoint. */
@@ -30,10 +44,28 @@ const UPSTREAM_URL = 'https://api.deepseek.com/user/balance'
 const BALANCE_CACHE_MS = 30_000
 /** How long one usage fold is reused; the fold walks session logs. */
 const USAGE_CACHE_MS = 10_000
+/** The history fold reads more logs than the today fold, so it is cached longer. */
+const HISTORY_CACHE_MS = 60_000
+/** The ledger only changes when the sampler runs, so it is cached longer still. */
+const LEDGER_CACHE_MS = 60_000
 /** Upstream request deadline. */
 const REQUEST_TIMEOUT_MS = 10_000
 /** Zstandard frame magic; session logs are a concatenation of independent frames. */
 const FRAME_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+/** How many days of per-day usage history a request may ask for. */
+const HISTORY_MAX_DAYS = 30
+/** Default history window when a request does not ask for one. */
+const HISTORY_DEFAULT_DAYS = 7
+/** How often the host samples the balance, whether or not a UI is open. */
+const SAMPLE_INTERVAL_MS = 15 * 60 * 1000
+/** Two samples closer together than this are collapsed. */
+const SAMPLE_MIN_INTERVAL_MS = 60 * 1000
+/** A changed or unchanged balance is still recorded at least this often. */
+const SAMPLE_HEARTBEAT_MS = 6 * 60 * 60 * 1000
+/** Samples older than this are pruned from the local store. */
+const SAMPLE_RETENTION_MS = 120 * 24 * 60 * 60 * 1000
+/** A gap this wide means the ledger may have missed spending inside it. */
+const LEDGER_GAP_WARN_MS = 3 * 60 * 60 * 1000
 
 /**
  * Chinese public holidays, as Beijing-time `YYYY-MM-DD` days that are OFF-peak
@@ -80,24 +112,52 @@ function beijingDateKey(timeMs) {
   return `${shifted.getUTCFullYear()}-${month}-${day}`
 }
 
+/** Local-time `YYYY-MM-DD` for an epoch millisecond value. */
+function localDateKey(timeMs) {
+  const date = new Date(timeMs)
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${date.getFullYear()}-${month}-${day}`
+}
+
 export const inject = ['webServer', 'credentials']
 
 /** Exported for out-of-tree verification of the fold. */
 export { readUsage as readTodayUsage }
 
+/** Exported for out-of-tree verification of the per-day fold. */
+export { readUsageHistory }
+
 /** Exported for out-of-tree verification of the peak/off-peak calendar. */
 export { isPeakHour }
 
-/** Local day boundary: the most recent local midnight. */
-function startOfToday() {
+/** Exported for out-of-tree verification of the balance ledger. */
+export { computeLedger }
+
+/** Exported for out-of-tree verification of day bucketing. */
+export { localDateKey, beijingDateKey }
+
+/** Local day boundary `offsetDays` before today (0 = today). */
+function startOfLocalDay(offsetDays = 0) {
   const now = new Date()
   now.setHours(0, 0, 0, 0)
+  now.setDate(now.getDate() - offsetDays)
   return now.getTime()
 }
 
 /** Coerce an unknown token field to a number. */
 function tokens(value) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+}
+
+/** Coerce a balance amount, which the upstream API sends as a string, to a number. */
+function amount(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string') {
+    const parsed = Number.parseFloat(value)
+    return Number.isFinite(parsed) ? parsed : undefined
+  }
+  return undefined
 }
 
 /**
@@ -122,8 +182,9 @@ function isPeakHour(timeMs) {
 /**
  * A zeroed token bucket for one billing window.
  *
- * `cacheWriteTokens` is always 0: DeepSeek's price table lists cache-hit input,
- * cache-miss input and output only, so a cache write is never billed.
+ * `cacheWriteTokens` is always 0: DeepSeek's local session records do not carry
+ * a cache-write field at all, and the published price table lists cache-hit
+ * input, cache-miss input and output only.
  */
 function zeroBucket() {
   return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
@@ -136,12 +197,112 @@ function addToBucket(bucket, input, output, cacheRead) {
   bucket.cacheReadTokens += cacheRead
 }
 
-/** Absolute path of the directory holding every session log. */
-function sessionsRoot() {
-  const home = process.env.DSH_HOME !== undefined && process.env.DSH_HOME !== ''
+/** A fresh accumulator for one day. */
+function emptyDay() {
+  return {
+    requests: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    reasoningTokens: 0,
+    peak: zeroBucket(),
+    offPeak: zeroBucket(),
+    byModel: new Map(),
+  }
+}
+
+/** A fresh accumulator for a whole fold. */
+function emptyAccumulator() {
+  return {
+    requests: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    reasoningTokens: 0,
+    failedFrames: 0,
+    byModel: new Map(),
+    peak: zeroBucket(),
+    offPeak: zeroBucket(),
+    byDay: new Map(),
+  }
+}
+
+/** One model row inside a day or a whole fold. */
+function emptyModelRow(provider, model) {
+  return {
+    provider,
+    model,
+    requests: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    reasoningTokens: 0,
+    peak: zeroBucket(),
+    offPeak: zeroBucket(),
+  }
+}
+
+/** Accumulate one assistant message into a model map. */
+function addToModel(map, provider, model, window, input, output, cacheRead, reasoning) {
+  const key = `${provider}/${model}`
+  const row = map.get(key) ?? emptyModelRow(provider, model)
+  row.requests += 1
+  row.inputTokens += input
+  row.outputTokens += output
+  row.cacheReadTokens += cacheRead
+  row.reasoningTokens += reasoning
+  addToBucket(row[window], input, output, cacheRead)
+  map.set(key, row)
+}
+
+/** Fold one qualifying assistant message into both the whole-fold and per-day totals. */
+function addRecord(acc, record) {
+  const usage = record.data?.usage
+  if (usage === undefined || usage === null) return
+  const input = tokens(usage.inputTokens)
+  const output = tokens(usage.outputTokens)
+  const cacheRead = tokens(usage.cacheReadTokens)
+  const reasoning = tokens(usage.reasoningTokens)
+  const window = isPeakHour(record.time) ? 'peak' : 'offPeak'
+  const source = record.data?.message?.source
+  const provider = typeof source?.provider === 'string' ? source.provider : 'unknown'
+  const model = typeof source?.model === 'string' ? source.model : 'unknown'
+
+  acc.requests += 1
+  acc.inputTokens += input
+  acc.outputTokens += output
+  acc.cacheReadTokens += cacheRead
+  acc.reasoningTokens += reasoning
+  addToBucket(acc[window], input, output, cacheRead)
+  addToModel(acc.byModel, provider, model, window, input, output, cacheRead, reasoning)
+
+  const key = localDateKey(record.time)
+  const day = acc.byDay.get(key) ?? emptyDay()
+  day.requests += 1
+  day.inputTokens += input
+  day.outputTokens += output
+  day.cacheReadTokens += cacheRead
+  day.reasoningTokens += reasoning
+  addToBucket(day[window], input, output, cacheRead)
+  addToModel(day.byModel, provider, model, window, input, output, cacheRead, reasoning)
+  acc.byDay.set(key, day)
+}
+
+/** Absolute path of the dsh home directory. */
+function dshHome() {
+  return process.env.DSH_HOME !== undefined && process.env.DSH_HOME !== ''
     ? process.env.DSH_HOME
     : join(homedir(), '.dsh')
-  return join(home, 'sessions')
+}
+
+/** Absolute path of the directory holding every session log. */
+function sessionsRoot() {
+  return join(dshHome(), 'sessions')
+}
+
+/** Absolute path of the plugin's own local balance-sample store. */
+function sampleStorePath() {
+  return join(dshHome(), 'dsh-plugin-balance-ui', 'balance-samples.json')
 }
 
 /** Collect session-log files touched at or after `since`, newest last. */
@@ -168,7 +329,7 @@ async function collectLogs(dir, since, out) {
   }
 }
 
-/** Fold every assistant message in one session log that landed today. */
+/** Fold every assistant message in one session log that landed at or after `since`. */
 async function foldLog(path, since, acc) {
   let buffer
   try {
@@ -192,42 +353,7 @@ async function foldLog(path, since, acc) {
         }
         if (record.type !== 'assistant/message') continue
         if (typeof record.time !== 'number' || record.time < since) continue
-        const usage = record.data?.usage
-        if (usage === undefined || usage === null) continue
-        const input = tokens(usage.inputTokens)
-        const output = tokens(usage.outputTokens)
-        const cacheRead = tokens(usage.cacheReadTokens)
-        const reasoning = tokens(usage.reasoningTokens)
-        // Which rate tier this message is billed at.
-        const window = isPeakHour(record.time) ? 'peak' : 'offPeak'
-        acc.requests += 1
-        acc.inputTokens += input
-        acc.outputTokens += output
-        acc.cacheReadTokens += cacheRead
-        acc.reasoningTokens += reasoning
-        addToBucket(acc[window], input, output, cacheRead)
-        const source = record.data?.message?.source
-        const provider = typeof source?.provider === 'string' ? source.provider : 'unknown'
-        const model = typeof source?.model === 'string' ? source.model : 'unknown'
-        const key = `${provider}/${model}`
-        const row = acc.byModel.get(key) ?? {
-          provider,
-          model,
-          requests: 0,
-          inputTokens: 0,
-          outputTokens: 0,
-          cacheReadTokens: 0,
-          reasoningTokens: 0,
-          peak: zeroBucket(),
-          offPeak: zeroBucket(),
-        }
-        row.requests += 1
-        row.inputTokens += input
-        row.outputTokens += output
-        row.cacheReadTokens += cacheRead
-        row.reasoningTokens += reasoning
-        addToBucket(row[window], input, output, cacheRead)
-        acc.byModel.set(key, row)
+        addRecord(acc, record)
       }
     } catch {
       acc.failedFrames += 1
@@ -236,23 +362,26 @@ async function foldLog(path, since, acc) {
   }
 }
 
-/** Fold today's usage across every session log. */
-async function readUsage() {
-  const since = startOfToday()
+/** Clamp a requested history window into the supported range. */
+function clampDays(value, fallback = HISTORY_DEFAULT_DAYS) {
+  if (value === undefined || value === null || value === '') return fallback
+  const parsed = Number.parseInt(String(value), 10)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.min(Math.max(1, parsed), HISTORY_MAX_DAYS)
+}
+
+/** Fold usage across every session log for a window of `days` local days. */
+async function foldWindow(days) {
+  const since = startOfLocalDay(days - 1)
   const logs = []
   await collectLogs(sessionsRoot(), since, logs)
-  const acc = {
-    requests: 0,
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadTokens: 0,
-    reasoningTokens: 0,
-    failedFrames: 0,
-    byModel: new Map(),
-    peak: zeroBucket(),
-    offPeak: zeroBucket(),
-  }
+  const acc = emptyAccumulator()
   for (const log of logs) await foldLog(log, since, acc)
+  return { since, logs: logs.length, acc }
+}
+
+/** Shape one accumulator into a JSON-friendly usage summary. */
+function summarize(acc, sessionFiles, since) {
   return {
     ok: true,
     since: new Date(since).toISOString(),
@@ -266,21 +395,216 @@ async function readUsage() {
     peak: acc.peak,
     offPeak: acc.offPeak,
     models: [...acc.byModel.values()].sort((left, right) => right.inputTokens + right.outputTokens - (left.inputTokens + left.outputTokens)),
-    sessionFiles: logs.length,
+    sessionFiles,
     failedFrames: acc.failedFrames,
     fetchedAt: new Date().toISOString(),
   }
 }
 
+/** Shape one day's accumulator into a JSON-friendly row. */
+function summarizeDay(key, day) {
+  return {
+    date: key,
+    requests: day.requests,
+    inputTokens: day.inputTokens,
+    outputTokens: day.outputTokens,
+    cacheReadTokens: day.cacheReadTokens,
+    reasoningTokens: day.reasoningTokens,
+    totalTokens: day.inputTokens + day.outputTokens + day.cacheReadTokens,
+    peak: day.peak,
+    offPeak: day.offPeak,
+    models: [...day.byModel.values()].sort((left, right) => right.inputTokens + right.outputTokens - (left.inputTokens + left.outputTokens)),
+  }
+}
+
+/** Fold today's usage across every session log. */
+async function readUsage() {
+  const { since, logs, acc } = await foldWindow(1)
+  return summarize(acc, logs, since)
+}
+
 /**
- * Mount both routes behind one short-lived cache each.
+ * Fold `days` of per-day usage across every session log.
+ *
+ * Days with no recorded activity are still emitted, so the client can line the
+ * window up against the ledger without inferring missing days.
+ */
+async function readUsageHistory(days) {
+  const window = clampDays(days)
+  const { since, logs, acc } = await foldWindow(window)
+  const rows = []
+  for (let offset = window - 1; offset >= 0; offset -= 1) {
+    const key = localDateKey(startOfLocalDay(offset))
+    const day = acc.byDay.get(key)
+    rows.push(day === undefined ? summarizeDay(key, emptyDay()) : summarizeDay(key, day))
+  }
+  return {
+    ...summarize(acc, logs, since),
+    days: window,
+    history: rows,
+  }
+}
+
+/** Whether a value is a usable stored balance sample. */
+function isSample(value) {
+  return value !== null
+    && typeof value === 'object'
+    && typeof value.t === 'number'
+    && Number.isFinite(value.t)
+    && typeof value.total === 'number'
+    && Number.isFinite(value.total)
+}
+
+/** Read the local balance-sample store, tolerating any corruption. */
+async function loadSamples() {
+  try {
+    const parsed = JSON.parse(await readFile(sampleStorePath(), 'utf8'))
+    const list = Array.isArray(parsed) ? parsed : parsed?.samples
+    return Array.isArray(list) ? list.filter(isSample) : []
+  } catch {
+    return []
+  }
+}
+
+/** Write the local balance-sample store through a temporary file. */
+async function saveSamples(samples) {
+  const path = sampleStorePath()
+  await mkdir(dirname(path), { recursive: true })
+  const temporary = `${path}.tmp`
+  await writeFile(temporary, JSON.stringify({ version: 1, samples }, null, 0), 'utf8')
+  await rename(temporary, path)
+}
+
+/**
+ * Turn a run of balance samples into per-day account movement.
+ *
+ * The account only ever exposes its CURRENT balance, so the amount actually
+ * charged is recovered as the sum of the decreases between consecutive
+ * samples. Increases are classified as top-ups (a rise in `topped_up_balance`)
+ * or grants (a rise in `granted_balance`) and are never counted as spending.
+ *
+ * Two honest limitations fall out of that, and both are reported rather than
+ * hidden:
+ *   - A decrease is attributed to the local day of the LATER sample, because
+ *     that is the moment it was observed, not necessarily when it happened.
+ *   - If a top-up and some spending fall inside one sampling gap, the two can
+ *     cancel out and the spending becomes invisible. `maxGapMs` and
+ *     `coveredFrom` let the client say how much of the window that affects.
+ *
+ * @param samples - stored `{ t, total, granted, toppedUp, currency }` rows.
+ * @param days - window length in local days, ending today.
+ * @param nowMs - current time, injectable for verification.
+ */
+function computeLedger(samples, days, nowMs = Date.now()) {
+  const windowDays = Math.max(1, Math.trunc(days) || 1)
+  const windowStart = startOfLocalDay(windowDays - 1)
+  const clean = (Array.isArray(samples) ? samples : [])
+    .filter(isSample)
+    .slice()
+    .sort((left, right) => left.t - right.t)
+
+  const byDay = new Map()
+  const rowFor = (timeMs) => {
+    const key = localDateKey(timeMs)
+    let row = byDay.get(key)
+    if (row === undefined) {
+      row = { date: key, spend: 0, topUp: 0, grant: 0, observations: 0 }
+      byDay.set(key, row)
+    }
+    return row
+  }
+
+  // The anchor is the newest sample at or before the window opened: it is the
+  // account's opening value, and every later change is measured against it.
+  let anchor
+  for (const sample of clean) {
+    if (sample.t <= windowStart) anchor = sample
+    else break
+  }
+  const firstInside = clean.find((sample) => sample.t > windowStart)
+
+  const events = []
+  let maxGapMs = 0
+  let previous = anchor
+  for (const sample of clean) {
+    if (sample.t <= windowStart) continue
+    if (previous !== undefined) {
+      const gap = sample.t - previous.t
+      if (gap > maxGapMs) maxGapMs = gap
+      const spent = previous.total - sample.total
+      const toppedUp = (sample.toppedUp ?? 0) - (previous.toppedUp ?? 0)
+      const granted = (sample.granted ?? 0) - (previous.granted ?? 0)
+      const row = rowFor(sample.t)
+      row.observations += 1
+      if (spent > 0) {
+        row.spend += spent
+        events.push({ at: sample.t, kind: 'spend', amount: spent })
+      }
+      if (toppedUp > 0) {
+        row.topUp += toppedUp
+        events.push({ at: sample.t, kind: 'topUp', amount: toppedUp })
+      }
+      if (granted > 0) {
+        row.grant += granted
+        events.push({ at: sample.t, kind: 'grant', amount: granted })
+      }
+    }
+    previous = sample
+  }
+
+  const days_rows = []
+  let spend = 0
+  let topUp = 0
+  let grant = 0
+  for (let offset = windowDays - 1; offset >= 0; offset -= 1) {
+    const key = localDateKey(startOfLocalDay(offset))
+    const row = byDay.get(key) ?? { date: key, spend: 0, topUp: 0, grant: 0, observations: 0 }
+    spend += row.spend
+    topUp += row.topUp
+    grant += row.grant
+    days_rows.push(row)
+  }
+
+  const newest = clean.length > 0 ? clean[clean.length - 1] : undefined
+  const coveredFrom = anchor !== undefined ? anchor.t : firstInside?.t
+  return {
+    ok: true,
+    days: windowDays,
+    currency: newest?.currency ?? null,
+    spend,
+    topUp,
+    grant,
+    balance: newest?.total ?? null,
+    granted: newest?.granted ?? null,
+    toppedUp: newest?.toppedUp ?? null,
+    sampleCount: clean.length,
+    // Whether the window opened with a known balance, and how far back the
+    // samples actually reach.
+    covered: anchor !== undefined,
+    coveredFrom: coveredFrom === undefined ? null : new Date(coveredFrom).toISOString(),
+    unobservedMs: coveredFrom === undefined ? null : Math.max(0, nowMs - coveredFrom),
+    maxGapMs,
+    gapSuspect: maxGapMs > LEDGER_GAP_WARN_MS,
+    events: events.slice(-40),
+    rows: days_rows,
+    fetchedAt: new Date().toISOString(),
+  }
+}
+
+/**
+ * Mount the routes and the background sampler.
  * @param ctx - Host root context.
  */
 export function apply(ctx) {
-  let cachedBalance
-  let inflightBalance
-  let cachedUsage
-  let inflightUsage
+  const balanceSlot = {}
+  const usageSlot = {}
+  const historyCache = new Map()
+  const ledgerCache = new Map()
+
+  /** Resolved balance samples, loaded from disk once. */
+  let samples
+  let samplesLoaded = false
+  let sampling = false
 
   /** Read the balance from the upstream account API. */
   async function loadBalance() {
@@ -326,41 +650,112 @@ export function apply(ctx) {
   }
 
   /** Reuse one cached answer for a short window, collapsing concurrent callers. */
-  function cached(ttl, readCache, writeCache, readInflight, writeInflight, produce) {
-    const at = readCache()
+  function cached(slot, ttl, produce) {
+    const at = slot.value
     if (at !== undefined && Date.now() - at.at < ttl) return Promise.resolve(at.payload)
-    const running = readInflight()
-    if (running !== undefined) return running
+    if (slot.inflight !== undefined) return slot.inflight
     const promise = produce()
       .catch((error) => ({ ok: false, error: String(error?.message ?? error) }))
       .then((payload) => {
-        writeCache({ at: Date.now(), payload })
+        slot.value = { at: Date.now(), payload }
         return payload
       })
       .finally(() => {
-        writeInflight(undefined)
+        slot.inflight = undefined
       })
-    writeInflight(promise)
+    slot.inflight = promise
     return promise
   }
 
-  const readBalance = () => cached(
-    BALANCE_CACHE_MS,
-    () => cachedBalance,
-    (value) => { cachedBalance = value },
-    () => inflightBalance,
-    (value) => { inflightBalance = value },
-    loadBalance,
-  )
+  const readBalance = () => cached(balanceSlot, BALANCE_CACHE_MS, loadBalance)
 
-  const readUsageCached = () => cached(
-    USAGE_CACHE_MS,
-    () => cachedUsage,
-    (value) => { cachedUsage = value },
-    () => inflightUsage,
-    (value) => { inflightUsage = value },
-    readUsage,
-  )
+  const readUsageCached = () => cached(usageSlot, USAGE_CACHE_MS, readUsage)
+
+  /** Cache one promise per key, for the routes whose answer depends on `days`. */
+  function cachedByKey(map, ttl, key, produce) {
+    const hit = map.get(key)
+    if (hit !== undefined) {
+      if (hit.value !== undefined && Date.now() - hit.value.at < ttl) return Promise.resolve(hit.value.payload)
+      if (hit.inflight !== undefined) return hit.inflight
+    }
+    const slot = hit ?? {}
+    map.set(key, slot)
+    const promise = produce()
+      .catch((error) => ({ ok: false, error: String(error?.message ?? error) }))
+      .then((payload) => {
+        slot.value = { at: Date.now(), payload }
+        return payload
+      })
+      .finally(() => {
+        slot.inflight = undefined
+      })
+    slot.inflight = promise
+    return promise
+  }
+
+  const readHistory = (days) => cachedByKey(historyCache, HISTORY_CACHE_MS, clampDays(days), () => readUsageHistory(clampDays(days)))
+
+  /** Ensure the sample store has been read from disk exactly once. */
+  async function ensureSamples() {
+    if (samplesLoaded) return samples
+    samples = await loadSamples()
+    samplesLoaded = true
+    return samples
+  }
+
+  /**
+   * Record one balance reading, best-effort.
+   *
+   * Called both from the sampler timer and from the balance route, so a UI
+   * that is open produces denser samples than an idle machine. The network
+   * read behind it is already cached, so the extra call is cheap.
+   */
+  async function sampleOnce() {
+    if (sampling) return
+    sampling = true
+    try {
+      const payload = await readBalance()
+      if (payload.ok !== true) return
+      const info = Array.isArray(payload.infos) ? payload.infos[0] : undefined
+      if (info === undefined) return
+      const total = amount(info.total)
+      if (total === undefined) return
+      const granted = amount(info.granted)
+      const toppedUp = amount(info.toppedUp)
+      const list = await ensureSamples()
+      const now = Date.now()
+      const last = list[list.length - 1]
+      const changed = last === undefined
+        || last.total !== total
+        || last.granted !== granted
+        || last.toppedUp !== toppedUp
+        || last.currency !== info.currency
+      const elapsed = last === undefined ? Number.POSITIVE_INFINITY : now - last.t
+      if (!(last === undefined || (changed && elapsed >= SAMPLE_MIN_INTERVAL_MS) || elapsed >= SAMPLE_HEARTBEAT_MS)) return
+      list.push({ t: now, currency: info.currency, total, granted, toppedUp })
+      const cutoff = now - SAMPLE_RETENTION_MS
+      while (list.length > 0 && list[0].t < cutoff) list.shift()
+      await saveSamples(list)
+    } catch {
+      /* sampling is best-effort and must never disturb the host */
+    } finally {
+      sampling = false
+    }
+  }
+
+  const readLedger = (days) => cachedByKey(ledgerCache, LEDGER_CACHE_MS, clampDays(days), async () => {
+    const list = await ensureSamples()
+    return { ...computeLedger(list, clampDays(days)), store: sampleStorePath() }
+  })
+
+  // Sample on a timer so the ledger keeps filling even with no UI open. The
+  // timer is unref'd, so it can never hold the process open on its own.
+  ctx.effect(() => {
+    void sampleOnce()
+    const timer = setInterval(() => { void sampleOnce() }, SAMPLE_INTERVAL_MS)
+    if (typeof timer.unref === 'function') timer.unref()
+    return () => { clearInterval(timer) }
+  }, 'balance-ui: balance sampler')
 
   /** Register one same-origin JSON GET route. */
   function route(path, produce) {
@@ -380,7 +775,7 @@ export function apply(ctx) {
           res.end('method not allowed')
           return
         }
-        const payload = await produce()
+        const payload = await produce(req)
         res.writeHead(200, {
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store',
@@ -393,6 +788,18 @@ export function apply(ctx) {
     }), `balance-ui: ${path} route`)
   }
 
-  route(BALANCE_PATH, readBalance)
-  route(USAGE_PATH, readUsageCached)
+  /** Read `?days=` off a request without letting it influence the fold. */
+  function daysOf(req) {
+    const query = req.url?.includes('?') === true ? req.url.slice(req.url.indexOf('?') + 1) : ''
+    return clampDays(new URLSearchParams(query).get('days'))
+  }
+
+  route(BALANCE_PATH, async () => {
+    const payload = await readBalance()
+    void sampleOnce()
+    return payload
+  })
+  route(USAGE_PATH, () => readUsageCached())
+  route(HISTORY_PATH, (req) => readHistory(daysOf(req)))
+  route(LEDGER_PATH, (req) => readLedger(daysOf(req)))
 }

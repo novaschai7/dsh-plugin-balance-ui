@@ -14,6 +14,7 @@ With the sidebar expanded:
 | 今日 | Today's total tokens (input + output + cache hits), compacted |
 | 花费 | Estimated spend for today, in CNY |
 | 时段 | `高峰` or `空闲` for the billing tier in force right now |
+| 对账 | Over the last 7 days, the gap between the local estimate and what the account balance actually lost |
 
 While the sidebar is collapsed, the same four values are stacked as compact text inside the rail.
 
@@ -52,6 +53,25 @@ The 2026 Chinese public holidays are listed explicitly, from 国务院办公厅�
 
 **The spend figure is an estimate, not a bill.** It is computed from locally recorded token counts and published list prices. It does not know about discounts, grants, or any pricing change DeepSeek makes after this release.
 
+## Reconciliation: why the estimate and the bill disagree
+
+An estimate that silently drifts from the real bill is worse than no estimate, and nothing on this machine can see the difference on its own: session logs record what dsh *used*, while only the account knows what it was *charged*.
+
+So the host half samples the account balance on a timer — every 15 minutes whether or not a UI is open, plus whenever the footer polls — and keeps a small local history. Spending is recovered as the sum of the balance **decreases** between samples. Increases are never counted as spending; they are classified as a top-up (a rise in `topped_up_balance`) or a grant (a rise in `granted_balance`).
+
+The footer's `对账` row then shows the 7-day gap between the two, and the tooltip breaks it down per day and names every cause it can actually observe:
+
+- **Usage this machine never saw.** The real charge is higher than the log estimate — calls from another client, a direct API integration, or session logs that were pruned.
+- **Discounts or grants absorbing the cost.** The real charge is lower than the estimate.
+- **Credit movements.** Top-ups and grant credits inside the window are reported so they are not mistaken for spending.
+- **Sampling gaps.** A decrease is attributed to the local day of the *later* sample, and if a top-up and some spending fall inside one gap they can cancel out and hide the spending. When the largest gap is wide enough for that to matter, the panel says so.
+- **Holiday attribution.** Days inside the window that are Chinese public holidays are listed, because they are priced off-peak.
+- **Unpriced models.** Tokens from a model with no rate-table entry are reported rather than quietly costed at zero.
+
+**Two blind spots are stated rather than papered over.** Local session records carry no cache-write field at all, so if DeepSeek charges for cache writes, that cost is invisible to this estimate and the panel says so unconditionally. And reconciliation is only attempted for a **CNY** account: the rate table is in CNY, so a differently-denominated account is left uncompared instead of compared wrongly.
+
+A fresh install has no samples yet, so the row reads `样本不足` until the sampler has run for a while.
+
 ## Install
 
 From the plugin market (dsh-market), search for `balance-ui`.
@@ -72,18 +92,32 @@ Then restart the dsh service so the new profile layer is composed.
 
 ## Routes
 
-The host half registers two same-origin, read-only JSON routes:
+The host half registers four same-origin, read-only JSON routes:
 
 | Route | Payload |
 | --- | --- |
 | `GET /dsh-balance` | `{ ok, available, infos: [{ currency, total, granted, toppedUp }] }` |
 | `GET /dsh-usage` | Today's token totals, peak/off-peak buckets, and per-model rows |
+| `GET /dsh-usage-history?days=7` | The same shape, bucketed per local day, for 1–30 days |
+| `GET /dsh-spend-ledger?days=7` | Sampled account movement per day, plus top-ups, grants and sampling gaps |
 
-Both reject non-`GET`/`HEAD` methods and cross-origin requests, and send `cache-control: no-store`.
+All four reject non-`GET`/`HEAD` methods and cross-origin requests, and send `cache-control: no-store`.
 
 ## Privacy
 
-The API key is resolved inside the dsh process and used only for the upstream balance request. It is never written to a response, a log line, or an error message. The plugin reads session logs and writes nothing. There is no telemetry and no third-party service.
+The API key is resolved inside the dsh process and used only for the upstream balance request. It is never written to a response, a log line, or an error message. Session logs are read, never written.
+
+The one thing this plugin does write is its own balance-sample store, at `$DSH_HOME/dsh-plugin-balance-ui/balance-samples.json` (by default `~/.dsh/dsh-plugin-balance-ui/balance-samples.json`). It holds nothing but timestamps and the four balance figures the upstream API already returned — no key, no prompt, no token counts — and it is pruned to the last 120 days. Deleting the file is safe: the plugin starts sampling again and reconciliation returns to `样本不足`.
+
+There is no telemetry and no third-party service.
+
+## Tests
+
+```sh
+npm test
+```
+
+Runs the `node:test` suite with no dependencies: the peak/off-peak calendar, the balance-ledger maths (spend, top-ups, grants, coverage, sampling gaps), the per-day fold against synthetic session logs, the reconciliation maths (including the non-CNY guard), and the routes end-to-end against a fake cordis context and a stubbed upstream.
 
 ## License
 
