@@ -1,0 +1,50 @@
+{
+  "name": "dsh-plugin-balance-ui",
+  "version": "0.1.0",
+  "description": "Shows your DeepSeek account balance, today's token usage, and the estimated spend for the current peak or off-peak rate tier in the sidebar footer. · 在侧边栏底部显示 DeepSeek 账户余额、今日 token 用量，以及按当前峰谷档位估算的花费。",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/novaschai7/dsh-plugin-balance-ui.git"
+  },
+  "homepage": "https://github.com/novaschai7/dsh-plugin-balance-ui",
+  "bugs": {
+    "url": "https://github.com/novaschai7/dsh-plugin-balance-ui/issues"
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "balance",
+    "usage",
+    "tokens",
+    "cost"
+  ],
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ]
+}
